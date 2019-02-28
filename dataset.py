@@ -1,6 +1,7 @@
 from io import BytesIO
 import pickle
 import PIL
+import random
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import Sampler, RandomSampler, BatchSampler, _int_classes
@@ -88,8 +89,19 @@ class IndexedFileDataset(Dataset):
         (name, offset, size).
     """
     def __init__(self, filename, index_filename=None, extract_target_fn=None,
-                 transform=None, target_transform=None, loader=image_loader):
+                 transform=None, target_transform=None, loader=image_loader,
+                 in_memory=False, decoded=False, preshuffle=False,
+                 partition_offset=0, total_partitions=1):
         super(IndexedFileDataset, self).__init__()
+
+        self.in_memory = in_memory
+        # Whether to store images in-memory as decoded or not
+        self.decoded = decoded
+
+        self.filename = filename
+        self.loader = loader
+        self.transform = transform
+        self.target_transform = target_transform
 
         # Defaults
         if index_filename is None:
@@ -101,23 +113,48 @@ class IndexedFileDataset(Dataset):
         with open(index_filename, 'rb') as index_fp:
             sample_list = pickle.load(index_fp)
 
+        # Shuffle index (loads very slowly for large files)
+        if preshuffle:
+            random.shuffle(sample_list)
+
+        # Read subset of index
+        psize = len(sample_list) // total_partitions
+        sample_list = sample_list[partition_offset:partition_offset + psize]
+
         # Collect unique targets (sorted by name)
         targetset = set(extract_target_fn(target) for target, _, _ in sample_list)
         targetmap = {target: i for i, target in enumerate(sorted(targetset))}
 
-        self.samples = [(targetmap[extract_target_fn(target)], offset, size)
-                        for target, offset, size in sample_list]
-        self.filename = filename
+        
+        if self.in_memory:
+            # Store samples in memory
+            with open(filename, 'rb') as fp:
+                self.samples = [(self._get_rawsample(fp, offset, size), 
+                                 targetmap[extract_target_fn(target)])
+                                for target, offset, size in sample_list]
+        else:
+            # Store file offset and size
+            self.samples = [(targetmap[extract_target_fn(target)], offset, size)
+                            for target, offset, size in sample_list]
 
-        self.loader = loader
-        self.transform = transform
-        self.target_transform = target_transform
+        # Determine sample loading function
+        if self.in_memory:
+            if self.decoded:
+                self.getsamplefn = self._get_decoded_samples
+            else:
+                self.getsamplefn = self._get_encoded_samples
+        else:
+            self.getsamplefn = self._get_samples
 
-    def _get_sample(self, fp, idx):
-        target, offset, size = self.samples[idx]
+
+    ### Methods for reading and decoding samples
+    def _get_rawsample(self, fp, offset, size):
         fp.seek(offset)
-        sample = self.loader(fp.read(size))
+        if self.decoded:
+            return self.loader(fp.read(size))
+        return fp.read(size)
 
+    def _transform_sample(self, sample, target):
         if self.transform is not None:
             sample = self.transform(sample)
         if self.target_transform is not None:
@@ -125,7 +162,35 @@ class IndexedFileDataset(Dataset):
 
         return sample, target
 
-    def __getitem__(self, index):
+    def _get_sample(self, fp, idx):
+        target, offset, size = self.samples[idx]
+        fp.seek(offset)
+        sample = self.loader(fp.read(size))
+        return self._transform_sample(sample, target)
+    ###
+
+    ### Methods for loading samples from memory or file
+    def _get_encoded_samples(self, index):
+        # Handle slices
+        if isinstance(index, slice):
+            return [self._transform_sample(self.loader(self.samples[subidx][0]), 
+                                           self.samples[subidx][1]) for subidx in
+                    range(index.start or 0, index.stop or len(self),
+                          index.step or 1)]
+
+        sample, target = self.samples[index]
+        return self._transform_sample(self.loader(sample), target)
+
+    def _get_decoded_samples(self, index):
+        # Handle slices
+        if isinstance(index, slice):
+            return [self._transform_sample(*self.samples[subidx]) for subidx in
+                    range(index.start or 0, index.stop or len(self),
+                          index.step or 1)]
+
+        return self._transform_sample(*self.samples[index])
+
+    def _get_samples(self, index):
         with open(self.filename, 'rb') as fp:
             # Handle slices
             if isinstance(index, slice):
@@ -134,6 +199,10 @@ class IndexedFileDataset(Dataset):
                               index.step or 1)]
 
             return self._get_sample(fp, index)
+    ###
+
+    def __getitem__(self, index):
+        return self.getsamplefn(index)
 
     def __len__(self):
         return len(self.samples)
